@@ -42,7 +42,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`，无 `any`） | `npm run build` 内含 `tsc --noEmit` 类型检查 |
 | UI 组件库 | Ant Design 5（含 `@ant-design/icons`） | 表格、卡片、Modal、Form、Segmented、Badge 交互 |
 | 构建工具 | Vite 5 | 开发服务器端口 22828 |
-| 状态管理 | Zustand 4 | `projectStore` / `sessionStore` / `takeStore` / `pickStore` |
+| 状态管理 | Zustand 4 | `projectStore` / `sessionStore` / `takeStore` / `pickStore` / `roleStore` |
 | 路由 | React Router 6（`createBrowserRouter` + 懒加载） | nginx 侧配合 `try_files` 做 SPA fallback |
 | 本地存储 | Dexie 4（IndexedDB 封装） | 库名 `gbstudiotake-db`，含结构版本号与 upgrade 迁移 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -66,10 +66,10 @@ npm run preview    # 本地预览构建产物（http://localhost:22828）
 | 路由 | 模块 | 消费模型 | 主要交互 |
 | --- | --- | --- | --- |
 | `/projects` | 录音项目与曲目台账 | Project、Song | 新建/编辑/删除项目与曲目（删除确认与级联）、按状态与委托方筛选、卡片回显曲目数 / 场次数 / 已优选 Take 数、筛选同步 URL query |
-| `/sessions` | 场次安排与参与乐手 | Session、Song | 按日期与棚号排期、**同棚号同时段冲突真实拦截并列出占用场次**、乐手席位统计、增删改 |
-| `/takes` | Take 标记台 | Take、Session | 录入起止时间码（校验先后、重叠提示）、同场次 Take 号自动递增、问题标签与评级、**表格多选批量改评级**、时间码区间筛选 |
-| `/picks` | 优选 Take 汇总 | Pick、Take | 从「可用」条次中挑选、**拖拽卡片 + 上下移调整剪接顺序**、自动生成剪接清单与合计时长、备注编辑 |
-| `/retakes` | 补录计划与导出 | Retake 及全部模型 | 由问题 Take 一键生成补录、状态流转与完成联动曲目状态、场次记录表导出、本地库版本查看与整库导入导出 |
+| `/sessions` | 场次安排与参与乐手 | Session、Song | 按日期与棚号排期、**同棚号同时段冲突真实拦截并列出占用场次**、乐手席位统计、增删改、**制作人封版 / 重开（重开必填原因并留痕）、封版筛选、乐观并发防旧内容覆盖** |
+| `/takes` | Take 标记台 | Take、Session | 录入起止时间码（校验先后、重叠提示）、同场次 Take 号自动递增、问题标签与评级、**表格多选批量改评级**、时间码区间筛选、**封版场次只读；时间码 / 评级 / 问题标签改动即令优选失效待复核、已排期补录退回待安排** |
+| `/picks` | 优选 Take 汇总 | Pick、Take | 从「可用」条次中挑选、**拖拽卡片 + 上下移调整剪接顺序**、自动生成剪接清单与合计时长、备注编辑、**来源 Take 改动后优选失效待复核（暂移出剪接清单），制作人复核通过后恢复** |
+| `/retakes` | 补录计划与导出 | Retake 及全部模型 | 由问题 Take 一键生成补录（**关联 Take**）、状态流转与完成联动曲目状态、场次记录表导出、本地库版本查看与整库导入导出 |
 
 ---
 
@@ -89,11 +89,11 @@ sologsb101-1028/
     ├── public/favicon.svg
     └── src/
         ├── main.tsx  App.tsx  vite-env.d.ts
-        ├── types/              # project.ts song.ts session.ts take.ts pick.ts retake.ts filter.ts
-        ├── stores/             # projectStore sessionStore takeStore pickStore
+        ├── types/              # project.ts song.ts session.ts take.ts pick.ts retake.ts role.ts filter.ts
+        ├── stores/             # projectStore sessionStore takeStore pickStore roleStore
         ├── components/common/  # TakeBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
         ├── hooks/              # useTakeFilter.ts useIdbTable.ts
-        ├── utils/              # timecode.ts db.ts export.ts seed.ts uuid.ts
+        ├── utils/              # timecode.ts db.ts export.ts seed.ts uuid.ts guards.ts
         ├── pages/              # ProjectList SessionPlan TakeBoard PickSummary RetakePlan
         ├── styles/main.css
         ├── router/index.tsx    # 路由表（懒加载页面 + App 布局）
@@ -105,9 +105,12 @@ sologsb101-1028/
 
 ## 六、数据存储说明
 
-- **IndexedDB 库名**：`gbstudiotake-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
+- **IndexedDB 库名**：`gbstudiotake-db`（Dexie 封装），结构版本号 `version(2)`，保留 v1 → v2 的 `upgrade()` 迁移逻辑（为历史场次补封版字段、优选补复核字段、补录补 `takeId`）。
 - **分表存储**：`projects` 项目、`songs` 曲目、`sessions` 场次、`takes` 条次、`picks` 优选、`retakes` 补录，共 6 张表；每行带 `revision` / `createdAt` / `updatedAt`。
 - **首屏自动播种**：`utils/db.ts` 的 `initDatabase()` 在 `projects` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录），保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
 - **时间码规则**：格式 `HH:MM:SS:FF`，帧率 25 帧；`utils/timecode.ts` 提供互转、时长汇总、重叠检测与 Take 号自动递增。
 - **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。
-- **级联规则**：删除项目级联删除其曲目、场次、Take、优选与补录；删除场次级联删除其 Take 与对应优选。
+- **级联规则**：删除项目级联删除其曲目、场次、Take、优选与补录；删除场次级联删除其 Take 与对应优选（已封版场次禁止删除，需先由制作人重开）。
+- **封版 / 重开**：顶栏可切换「制作人 / 录音师 / 棚务统筹」身份（仅前端权限演示）。制作人封版后，该场次的场次信息、Take、优选均只读，新增 / 编辑 / 删除 / 批量改评级 / 拖拽排序一律被拦截；重开必须填写原因，封版与重开动作写入 `lockHistory` 留痕。
+- **改动联动**：任一未封版 Take 的时间码（`startTc` / `endTc`）、评级（`grade`）或问题标签（`issues`）一旦改动，引用它的优选立即置为「待复核」（记录失效原因并暂时移出剪接清单，制作人复核通过后恢复），关联它的「已排期」补录计划自动退回「待安排」；改 Take 号、备注等不触发联动。
+- **并发保存**：场次与 Take 编辑带基于 `updatedAt` 的乐观并发校验。两个标签页同时修改同一场次（或同一条次）时，落后保存的一方不会覆盖新版本：本次保存被拒绝、**表单输入原样保留**，并提示「场次已封版 / 已被改动」，可一键「载入最新版本」对照后重存。

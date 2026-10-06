@@ -3,6 +3,9 @@
  * 只在 projects 表为空时执行。项目 → 曲目 → 场次 → Take → 优选 / 补录 互相引用，
  * 保证 5 个页面第一次进入都有可点通的内容。函数本身幂等：由调用方判定表是否为空。
  *
+ * v2 演示：ss-001 已被制作人封版（含一次重开留痕），其 T02 改动导致优选 T01 待复核；
+ * 关联 T02 的补录 rt-001 已排期（改动 T02 时会退回待安排）。
+ *
  * 注意：这里对 ./db 只做 **类型** 引用（运行期由调用方传入 db 实例），
  * 否则 utils/seed ⇄ utils/db 会互相 import 形成循环依赖。
  * ROW_REVISION 来自叶子模块 ./revision，同样避免运行期依赖 ./db。
@@ -37,10 +40,28 @@ const SONGS: Array<Omit<SongRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
 ];
 
 const SESSIONS: Array<Omit<SessionRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'ss-001', songId: 'sg-001', date: '2024-03-12', period: '上午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '鼓：许峰、贝斯：黎川、吉他：程野', state: '已完成' },
-  { id: 'ss-002', songId: 'sg-001', date: '2024-03-13', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '弦乐四重奏', state: '已完成' },
-  { id: 'ss-003', songId: 'sg-002', date: '2024-03-20', period: '晚上', engineer: '何笙', roomNo: 'B 棚', musicians: '大提琴：闻州', state: '已排期' },
-  { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成' }
+  {
+    id: 'ss-001',
+    songId: 'sg-001',
+    date: '2024-03-12',
+    period: '上午',
+    engineer: '赵鸣',
+    roomNo: 'A 棚',
+    musicians: '鼓：许峰、贝斯：黎川、吉他：程野',
+    state: '已完成',
+    lockState: '已封版',
+    lockedAt: '2024-03-13T10:30:00.000Z',
+    lockedBy: '制作人',
+    reopenReason: '制作人确认主歌优选后封版，T03 噪声需补录，曾短暂重开',
+    lockHistory: [
+      { action: '封版', actor: '制作人', at: '2024-03-12T12:10:00.000Z', reason: '' },
+      { action: '重开', actor: '制作人', at: '2024-03-13T09:00:00.000Z', reason: 'T03 噪声问题需补录标记，申请短暂重开' },
+      { action: '封版', actor: '制作人', at: '2024-03-13T10:30:00.000Z', reason: '' }
+    ]
+  },
+  { id: 'ss-002', songId: 'sg-001', date: '2024-03-13', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '弦乐四重奏', state: '已完成', lockState: '未封版', lockedAt: '', lockedBy: '', reopenReason: '', lockHistory: [] },
+  { id: 'ss-003', songId: 'sg-002', date: '2024-03-20', period: '晚上', engineer: '何笙', roomNo: 'B 棚', musicians: '大提琴：闻州', state: '已排期', lockState: '未封版', lockedAt: '', lockedBy: '', reopenReason: '', lockHistory: [] },
+  { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成', lockState: '未封版', lockedAt: '', lockedBy: '', reopenReason: '', lockHistory: [] }
 ];
 
 const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
@@ -53,14 +74,22 @@ const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
 ];
 
 const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'pk-001', takeId: 'tk-001', usage: '主歌', order: 1, note: '第 1 段最稳，鼓组干净' },
-  { id: 'pk-002', takeId: 'tk-004', usage: '副歌', order: 2, note: '弦乐起弓整齐' },
-  { id: 'pk-003', takeId: 'tk-006', usage: '全曲', order: 3, note: '钢琴整轨留作参考' }
+  {
+    id: 'pk-001',
+    takeId: 'tk-001',
+    usage: '主歌',
+    order: 1,
+    note: '第 1 段最稳，鼓组干净',
+    reviewState: '待复核',
+    reviewNote: '重开期间来源 Take（T01）时间码有微调，优选失效待制作人复核'
+  },
+  { id: 'pk-002', takeId: 'tk-004', usage: '副歌', order: 2, note: '弦乐起弓整齐', reviewState: '有效', reviewNote: '' },
+  { id: 'pk-003', takeId: 'tk-006', usage: '全曲', order: 3, note: '钢琴整轨留作参考', reviewState: '有效', reviewNote: '' }
 ];
 
 const RETAKES: Array<Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'rt-001', songId: 'sg-001', reason: 'T02 音准偏差，主歌需重录', planDate: '2024-03-25', state: '已排期' },
-  { id: 'rt-002', songId: 'sg-003', reason: '踏板噪声偏大，需重录第二段', planDate: '2024-03-27', state: '待安排' }
+  { id: 'rt-001', songId: 'sg-001', takeId: 'tk-002', reason: 'T02 音准偏差，主歌需重录', planDate: '2024-03-25', state: '已排期' },
+  { id: 'rt-002', songId: 'sg-003', takeId: '', reason: '踏板噪声偏大，需重录第二段', planDate: '2024-03-27', state: '待安排' }
 ];
 
 /** 灌入演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录）；目标库由调用方传入，避免反向 import */

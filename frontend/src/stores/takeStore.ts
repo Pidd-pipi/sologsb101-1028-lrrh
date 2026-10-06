@@ -1,10 +1,17 @@
 /**
  * Take store：维护条次列表的评级 / 问题标签 / 时间码筛选，以及批量改评级。
+ * 写入统一过持久化层的封版守卫与改动级联（优选失效、补录退回）。
  */
 import { create } from 'zustand';
 import type { FilterModel } from '@/types/filter';
 import type { Take } from '@/types/take';
-import { bulkUpdateGrade, putTake, removeTake, updateTake } from '@/utils/db';
+import {
+  bulkUpdateGrade,
+  putTake,
+  removeTake,
+  saveTake,
+  type TakeCascade
+} from '@/utils/db';
 import { buildRow } from '@/hooks/useIdbTable';
 
 export const TAKE_FILTER_KEYS = ['grades', 'issues', 'sessionIds', 'minTc', 'maxTc'];
@@ -17,9 +24,10 @@ interface TakeState {
   toggleSelected: (id: string) => void;
   setSelected: (ids: string[]) => void;
   createTake: (payload: Omit<Take, 'id'>) => Promise<string>;
-  editTake: (id: string, patch: Partial<Take>) => Promise<void>;
+  /** 保存条次编辑；expectedUpdatedAt 用于乐观并发，返回优选 / 补录级联计数 */
+  editTake: (id: string, patch: Partial<Take>, expectedUpdatedAt?: number) => Promise<TakeCascade>;
   deleteTake: (id: string) => Promise<void>;
-  batchGrade: (ids: string[], grade: Take['grade']) => Promise<void>;
+  batchGrade: (ids: string[], grade: Take['grade']) => Promise<TakeCascade>;
 }
 
 export const useTakeStore = create<TakeState>()((set, get) => ({
@@ -40,16 +48,17 @@ export const useTakeStore = create<TakeState>()((set, get) => ({
     await putTake(row);
     return row.id;
   },
-  editTake: async (id, patch) => {
-    await updateTake(id, patch);
+  editTake: async (id, patch, expectedUpdatedAt) => {
+    return saveTake(id, patch, expectedUpdatedAt);
   },
   deleteTake: async (id) => {
     await removeTake(id);
     set((state) => ({ selectedIds: state.selectedIds.filter((item) => item !== id) }));
   },
   batchGrade: async (ids, grade) => {
-    await bulkUpdateGrade(ids, grade);
+    const cascade = await bulkUpdateGrade(ids, grade);
     set({ selectedIds: [] });
     void get();
+    return cascade;
   }
 }));

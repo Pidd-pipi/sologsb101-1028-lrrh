@@ -162,6 +162,12 @@ body {
   border-top: 2px dashed var(--studio-primary);
 }
 
+/* 失效待复核的优选卡片：橙色左边框，提示制作人复核 */
+.pick-pending.ant-card {
+  border-left: 3px solid #d68910;
+  background: #fdf8ef;
+}
+
 .take-row-selected {
   background: #eef6fb;
 }

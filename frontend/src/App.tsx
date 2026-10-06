@@ -1,13 +1,14 @@
 /** 应用外壳：左侧导航 + 顶部概览 + 路由出口 */
 import { useEffect, useMemo, useState } from 'react';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { Badge, Layout, Menu, Space, Tag, Typography, message } from 'antd';
+import { Badge, Layout, Menu, Segmented, Space, Tag, Tooltip, Typography, message } from 'antd';
 import {
   AudioOutlined,
   ClockCircleOutlined,
   FolderOpenOutlined,
   ScissorOutlined,
-  ReloadOutlined
+  ReloadOutlined,
+  UserSwitchOutlined
 } from '@ant-design/icons';
 // 路由常量与导航配置取自叶子模块 @/router/routes：App 在模块顶层就要用 ROUTES 构造图标表，
 // 若从 @/router（会 import App）引入会形成循环依赖 → TDZ「Cannot access before initialization」
@@ -15,6 +16,8 @@ import { NAV_ITEMS, ROUTES } from '@/router/routes';
 import { initDatabase, countAll, DB_NAME, DB_SCHEMA_VERSION } from '@/utils/db';
 import { useProjectStore } from '@/stores/projectStore';
 import { useSessionStore } from '@/stores/sessionStore';
+import { useRoleStore } from '@/stores/roleStore';
+import { ROLE_DESCRIPTIONS, STUDIO_ROLES, type StudioRole } from '@/types/role';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -33,6 +36,8 @@ export default function App() {
   const [messageApi, contextHolder] = message.useMessage();
   const currentProjectId = useProjectStore((state) => state.currentProjectId);
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
+  const role = useRoleStore((state) => state.role);
+  const setRole = useRoleStore((state) => state.setRole);
 
   async function refreshCounts(): Promise<void> {
     setCounts(await countAll());
@@ -120,6 +125,20 @@ export default function App() {
               <Tag>场次上下文：{currentSessionId ?? '未选择'}</Tag>
             </Space>
             <Space size={8}>
+              <Tooltip title={ROLE_DESCRIPTIONS[role]}>
+                <Space size={4}>
+                  <UserSwitchOutlined style={{ color: '#2f6f8f' }} />
+                  <Segmented<StudioRole>
+                    size="small"
+                    value={role}
+                    options={STUDIO_ROLES as StudioRole[]}
+                    onChange={(value) => {
+                      setRole(value);
+                      messageApi.info(`当前身份：${value}（${ROLE_DESCRIPTIONS[value]}）`);
+                    }}
+                  />
+                </Space>
+              </Tooltip>
               <Badge count={counts.takes ?? 0} showZero color="#2f6f8f" title="Take 总数" />
               <Link to={ROUTES.takes}>去标记 Take</Link>
             </Space>

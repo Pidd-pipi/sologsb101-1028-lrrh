@@ -1,36 +1,57 @@
 /**
- * 优选 store：维护优选顺序、剪接清单派生与备注。
+ * 优选 store：维护优选顺序、剪接清单派生、备注与制作人复核。
  */
 import { create } from 'zustand';
 import type { FilterModel } from '@/types/filter';
 import type { Pick } from '@/types/pick';
-import { nextPickOrder, putPick, removePick, reorderPicks, updatePick } from '@/utils/db';
+import {
+  nextPickOrder,
+  putPick,
+  removePick,
+  reorderPicks,
+  reviewPick as reviewPickRow,
+  updatePick
+} from '@/utils/db';
 import { buildRow } from '@/hooks/useIdbTable';
 
-export const PICK_FILTER_KEYS = ['usages'];
+export const PICK_FILTER_KEYS = ['usages', 'reviewStates'];
 
 interface PickState {
   filters: FilterModel;
   setFilters: (next: FilterModel) => void;
   resetFilters: () => void;
-  createPick: (payload: Omit<Pick, 'id' | 'order'>) => Promise<string>;
+  createPick: (payload: Partial<Omit<Pick, 'id' | 'order'>>) => Promise<string>;
   editPick: (id: string, patch: Partial<Pick>) => Promise<void>;
+  reviewPick: (id: string) => Promise<void>;
   deletePick: (id: string) => Promise<void>;
   move: (list: Pick[], from: number, to: number) => Promise<void>;
 }
 
 export const usePickStore = create<PickState>()((set) => ({
-  filters: { keyword: '', usages: [] },
+  filters: { keyword: '', usages: [], reviewStates: [] },
   setFilters: (next) => set({ filters: next }),
-  resetFilters: () => set({ filters: { keyword: '', usages: [] } }),
+  resetFilters: () => set({ filters: { keyword: '', usages: [], reviewStates: [] } }),
   createPick: async (payload) => {
     const order = await nextPickOrder();
-    const row = buildRow({ ...payload, order }, 'pick');
+    const row = buildRow(
+      {
+        takeId: payload.takeId ?? '',
+        usage: payload.usage ?? '主歌',
+        note: payload.note ?? '',
+        order,
+        reviewState: payload.reviewState ?? '有效',
+        reviewNote: payload.reviewNote ?? ''
+      } satisfies Omit<Pick, 'id'>,
+      'pick'
+    );
     await putPick(row);
     return row.id;
   },
   editPick: async (id, patch) => {
     await updatePick(id, patch);
+  },
+  reviewPick: async (id) => {
+    await reviewPickRow(id);
   },
   deletePick: async (id) => {
     await removePick(id);

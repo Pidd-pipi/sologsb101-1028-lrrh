@@ -15,6 +15,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   message
 } from 'antd';
@@ -62,6 +63,9 @@ export default function RetakePlan() {
   const [error, setError] = useState<string | null>(null);
   const [form] = Form.useForm<Omit<Retake, 'id'>>();
 
+  const takeById = useMemo(() => new Map(takes.map((take) => [take.id, take])), [takes]);
+  const watchSongId = Form.useWatch('songId', form) as string | undefined;
+
   useEffect(() => {
     void (async () => {
       setCounts(await countAll());
@@ -108,11 +112,12 @@ export default function RetakePlan() {
 
   async function submit(): Promise<void> {
     const values = await form.validateFields();
+    const payload: Omit<Retake, 'id'> = { ...values, takeId: values.takeId ?? '' };
     if (editing) {
-      await updateRetake(editing.id, values);
+      await updateRetake(editing.id, payload);
       message.success('补录条目已更新');
     } else {
-      await putRetake(buildRow(values, 'retake'));
+      await putRetake(buildRow(payload, 'retake'));
       message.success('补录条目已建立');
     }
     setDialogOpen(false);
@@ -132,14 +137,15 @@ export default function RetakePlan() {
       buildRow(
         {
           songId: session.songId,
+          takeId: take.id,
           reason: `${take.takeNo}（${take.startTc} → ${take.endTc}）${reasons ? `问题：${reasons}` : '评级不理想'}，需补录`,
           planDate: new Date().toISOString().slice(0, 10),
           state: '待安排'
-        } as Omit<Retake, 'id'>,
+        } satisfies Omit<Retake, 'id'>,
         'retake'
       )
     );
-    message.success('已生成补录条目');
+    message.success('已生成补录条目（关联该 Take；来源再改动会自动退回待安排）');
   }
 
   async function exportSheet(): Promise<void> {
@@ -177,13 +183,30 @@ export default function RetakePlan() {
     }
   }
 
+  /** 关联问题 Take 的候选（跟随表单选择的曲目过滤） */
+  const takeOptions = useMemo(
+    () =>
+      problemTakes
+        .filter((take) => {
+          if (!watchSongId) return true;
+          const session = sessions.find((item) => item.id === take.sessionId);
+          return session?.songId === watchSongId;
+        })
+        .map((take) => ({
+          label: `${take.takeNo} · ${take.startTc} → ${take.endTc}（${take.grade}${take.issues.filter((i) => i !== '无').length > 0 ? ` · ${take.issues.filter((i) => i !== '无').join('、')}` : ''}）`,
+          value: take.id
+        })),
+    [problemTakes, sessions, watchSongId]
+  );
+
   return (
     <div className="page">
       <div className="page__head">
         <div>
           <h2 className="page__title">补录计划与结构版本导出</h2>
           <p className="page__subtitle">
-            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 补录完成后自动联动曲目录制状态。
+            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 已排期补录关联来源 Take，来源时间码 / 评级 /
+            问题标签一改动即退回待安排；补录完成后联动曲目状态。
           </p>
         </div>
         <Space>
@@ -238,15 +261,37 @@ export default function RetakePlan() {
                 dataSource={scopedRetakes}
                 pagination={false}
                 columns={[
-                  { title: '曲目', minWidth: 180, render: (_, row) => songLabel(row.songId) },
+                  { title: '曲目', minWidth: 160, render: (_, row) => songLabel(row.songId) },
+                  {
+                    title: '关联 Take',
+                    width: 170,
+                    render: (_, row) => {
+                      const take = row.takeId ? takeById.get(row.takeId) : undefined;
+                      if (!take) return <span className="muted">手工计划（未关联）</span>;
+                      return (
+                        <Space direction="vertical" size={0}>
+                          <span>{take.takeNo}</span>
+                          <TakeBadge grade={take.grade} issues={take.issues} showIssues={false} />
+                        </Space>
+                      );
+                    }
+                  },
                   { title: '补录原因', dataIndex: 'reason', minWidth: 240 },
                   { title: '计划日期', dataIndex: 'planDate', width: 120 },
                   {
                     title: '状态',
                     dataIndex: 'state',
-                    width: 110,
+                    width: 130,
                     render: (value: string) => (
-                      <Tag color={value === '已完成' ? 'green' : value === '已排期' ? 'blue' : 'orange'}>{value}</Tag>
+                      <Tooltip
+                        title={
+                          value === '待安排'
+                            ? '来源关联 Take 改动时，已排期计划会自动退回待安排，等待重新排期'
+                            : undefined
+                        }
+                      >
+                        <Tag color={value === '已完成' ? 'green' : value === '已排期' ? 'blue' : 'orange'}>{value}</Tag>
+                      </Tooltip>
                     )
                   },
                   {
@@ -283,6 +328,7 @@ export default function RetakePlan() {
                             setEditing(row);
                             form.setFieldsValue({
                               songId: row.songId,
+                              takeId: row.takeId ?? '',
                               reason: row.reason,
                               planDate: row.planDate,
                               state: row.state
@@ -350,7 +396,7 @@ export default function RetakePlan() {
             <Card title="本地结构版本">
               <Descriptions column={1} size="small" bordered>
                 <Descriptions.Item label="库名">{DB_NAME}</Descriptions.Item>
-                <Descriptions.Item label="结构版本">v{DB_SCHEMA_VERSION}</Descriptions.Item>
+                <Descriptions.Item label="结构版本">v{DB_SCHEMA_VERSION}（含场次封版 / 优选复核）</Descriptions.Item>
                 <Descriptions.Item label="项目 / 曲目">
                   {counts.projects ?? 0} / {counts.songs ?? 0}
                 </Descriptions.Item>
@@ -410,6 +456,19 @@ export default function RetakePlan() {
         <Form form={form} layout="vertical">
           <Form.Item name="songId" label="曲目" rules={[{ required: true, message: '请选择曲目' }]}>
             <Select options={songs.map((song) => ({ label: songLabel(song.id), value: song.id }))} />
+          </Form.Item>
+          <Form.Item
+            name="takeId"
+            label="关联问题 Take（选填）"
+            extra={<span className="muted">关联后，该 Take 再改动会把已排期计划自动退回待安排</span>}
+          >
+            <Select
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              placeholder="手工计划可不关联"
+              options={takeOptions}
+            />
           </Form.Item>
           <Form.Item name="reason" label="补录原因" rules={[{ required: true, message: '请填写补录原因' }]}>
             <Input.TextArea rows={2} placeholder="如：T02 音准偏差，主歌需重录" />
