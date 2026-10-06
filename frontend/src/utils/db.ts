@@ -1,28 +1,45 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbstudiotake-db，数据结构版本号 version(1) 与 upgrade() 迁移逻辑
+ * - 数据库名 gbstudiotake-db，数据结构版本号 version(2)，含 v1→v2 upgrade() 迁移
  * - 项目 / 曲目 / 场次 / Take / 优选 / 补录 六张表分表存储
+ * - 场次封版后 Take / 优选 / 补录只读；Take 关键字段改动级联失效优选、退回补录
  * - 首次打开自动播种互相引用的演示数据，保证每个页面打开都有内容
  */
 import Dexie, { type Table } from 'dexie';
 import type { Project } from '../types/project';
 import type { Song } from '../types/song';
-import type { Session } from '../types/session';
+import type { Session, SessionLockLog } from '../types/session';
 import type { Take } from '../types/take';
 import type { Pick } from '../types/pick';
 import type { Retake } from '../types/retake';
 import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 import { ROW_REVISION } from './revision';
+import { EditConflictError, assertNotStale, invalidationNote, isTakeCoreChanged, lockedReason } from './lockdown';
 
 /** 数据库名 */
 export const DB_NAME = 'gbstudiotake-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号（定义在叶子模块 ./revision，避免与 ./seed 形成循环依赖） */
 export { ROW_REVISION };
+
+/** 写入场次 / Take 等行时的乐观并发依据：打开编辑弹窗时该行的 updatedAt */
+export interface WriteOptions {
+  expectedUpdatedAt?: number;
+  /** Take 写操作还要校验所属场次行是否被另一方改动 */
+  expectedSessionUpdatedAt?: number;
+}
+
+/** Take 保存后的级联结果，用于页面提示制作人复核 */
+export interface TakeSaveResult {
+  /** 失效待复核的优选数 */
+  invalidatedPicks: number;
+  /** 由已排期退回待安排的补录数 */
+  resetRetakes: number;
+}
 
 export interface Revisioned {
   revision: number;
@@ -48,7 +65,8 @@ export class GbStudioTakeDatabase extends Dexie {
   constructor() {
     super(DB_NAME);
 
-    this.version(DB_SCHEMA_VERSION)
+    // v1：六张表初版结构
+    this.version(1)
       .stores({
         projects: 'id, name, client, state, startDate, updatedAt',
         songs: 'id, projectId, title, arrangement, state, updatedAt',
@@ -68,6 +86,45 @@ export class GbStudioTakeDatabase extends Dexie {
               row.revision = ROW_REVISION;
               if (typeof row.createdAt !== 'number') row.createdAt = Date.now();
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
+            });
+        }
+      });
+
+    // v2：场次封版（finalized / lockLogs）、优选复核状态（reviewState / reviewNote）
+    // 不新增索引：封版状态通过 takes.sessionId 关联，现有索引已覆盖
+    this.version(2)
+      .stores({
+        projects: 'id, name, client, state, startDate, updatedAt',
+        songs: 'id, projectId, title, arrangement, state, updatedAt',
+        sessions: 'id, songId, date, period, roomNo, engineer, state, updatedAt',
+        takes: 'id, sessionId, takeNo, grade, startTc, updatedAt',
+        picks: 'id, takeId, usage, order, updatedAt',
+        retakes: 'id, songId, planDate, state, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('sessions')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.finalized !== 'boolean') row.finalized = false;
+            if (!Array.isArray(row.lockLogs)) row.lockLogs = [];
+            row.revision = ROW_REVISION;
+          });
+        await tx
+          .table('picks')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.reviewState !== '生效中' && row.reviewState !== '待复核') row.reviewState = '生效中';
+            if (typeof row.reviewNote !== 'string') row.reviewNote = '';
+            row.revision = ROW_REVISION;
+          });
+        // 其余表只同步行结构修订号
+        for (const name of ['projects', 'songs', 'takes', 'retakes']) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION;
             });
         }
       });
@@ -158,8 +215,66 @@ export async function putSession(row: SessionRow): Promise<void> {
   await db.sessions.put(row);
 }
 
-export async function updateSession(id: string, patch: Partial<Session>): Promise<void> {
-  await db.sessions.update(id, { ...patch, updatedAt: Date.now() } as never);
+/**
+ * 更新场次排期字段（乐观并发）。
+ * - 场次已封版 → 拒绝（封版后录音师只读；改排期必须先由制作人重开）
+ * - 打开弹窗后该行被另一标签页改过 → 拒绝并提示「场次已改动」
+ */
+export async function updateSession(id: string, patch: Partial<Session>, options: WriteOptions = {}): Promise<void> {
+  await db.transaction('rw', [db.sessions], async () => {
+    const current = await db.sessions.get(id);
+    if (!current) {
+      throw new EditConflictError('stale', '场次已被另一方删除');
+    }
+    const locked = lockedReason(current);
+    if (locked) throw new EditConflictError('locked', `${locked}，请联系制作人重开后再修改`);
+    assertNotStale(current.updatedAt, options.expectedUpdatedAt);
+    await db.sessions.update(id, { ...patch, updatedAt: Date.now() } as never);
+  });
+}
+
+/**
+ * 制作人封版场次：封版后场次及其 Take / 优选 / 补录对录音师只读。
+ * 带乐观并发，避免覆盖另一标签页的改动。
+ */
+export async function finalizeSession(id: string, role: string, options: WriteOptions = {}): Promise<void> {
+  await db.transaction('rw', [db.sessions], async () => {
+    const current = await db.sessions.get(id);
+    if (!current) throw new EditConflictError('stale', '场次已被另一方删除');
+    assertNotStale(current.updatedAt, options.expectedUpdatedAt);
+    if (current.finalized) throw new EditConflictError('locked', '场次已封版，无需重复封版');
+    const log: SessionLockLog = { action: '封版', role, reason: '', at: Date.now() };
+    await db.sessions.update(id, {
+      finalized: true,
+      lockLogs: [...current.lockLogs, log],
+      updatedAt: Date.now()
+    } as never);
+  });
+}
+
+/**
+ * 制作人重开场次：必须填写重开原因，原因写入封版审计日志。
+ */
+export async function reopenSession(
+  id: string,
+  reason: string,
+  role: string,
+  options: WriteOptions = {}
+): Promise<void> {
+  const trimmed = reason.trim();
+  if (!trimmed) throw new EditConflictError('invalid', '重开场次必须填写原因');
+  await db.transaction('rw', [db.sessions], async () => {
+    const current = await db.sessions.get(id);
+    if (!current) throw new EditConflictError('stale', '场次已被另一方删除');
+    assertNotStale(current.updatedAt, options.expectedUpdatedAt);
+    if (!current.finalized) throw new EditConflictError('invalid', '场次未封版，无需重开');
+    const log: SessionLockLog = { action: '重开', role, reason: trimmed, at: Date.now() };
+    await db.sessions.update(id, {
+      finalized: false,
+      lockLogs: [...current.lockLogs, log],
+      updatedAt: Date.now()
+    } as never);
+  });
 }
 
 /**
@@ -180,9 +295,14 @@ export async function findRoomConflict(
   return rows[0] ?? null;
 }
 
-/** 删除场次：级联删除其 Take 与对应优选 */
+/** 删除场次：已封版场次禁止删除；未封版场次级联删除其 Take 与对应优选 */
 export async function removeSession(id: string): Promise<void> {
   await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    const session = await db.sessions.get(id);
+    if (session) {
+      const locked = lockedReason(session);
+      if (locked) throw new EditConflictError('locked', `${locked}，请先由制作人重开后再删除`);
+    }
     const takes = await db.takes.where('sessionId').equals(id).toArray();
     const takeIds = takes.map((item) => item.id);
     if (takeIds.length > 0) {
@@ -200,24 +320,129 @@ export async function listTakes(): Promise<TakeRow[]> {
 }
 
 export async function putTake(row: TakeRow): Promise<void> {
-  await db.takes.put(row);
-}
-
-export async function updateTake(id: string, patch: Partial<Take>): Promise<void> {
-  await db.takes.update(id, { ...patch, updatedAt: Date.now() } as never);
-}
-
-/** 批量改评级 */
-export async function bulkUpdateGrade(ids: string[], grade: Take['grade']): Promise<void> {
-  await db.transaction('rw', [db.takes], async () => {
-    for (const id of ids) {
-      await db.takes.update(id, { grade, updatedAt: Date.now() } as never);
-    }
+  await db.transaction('rw', [db.sessions, db.takes], async () => {
+    const session = await db.sessions.get(row.sessionId);
+    if (!session) throw new EditConflictError('invalid', '所属场次不存在，无法标记 Take');
+    const locked = lockedReason(session);
+    if (locked) throw new EditConflictError('locked', `${locked}，不能在该场次新增 Take`);
+    await db.takes.put(row);
   });
 }
 
+/**
+ * 更新一条 Take（乐观并发）。
+ * - 所属场次已封版 → 拒绝（封版后录音师只读）
+ * - Take 行或场次行在打开弹窗后被另一方改动 → 拒绝并提示「场次已改动」
+ * - 时间码 / 评级 / 问题标签一旦改动：该 Take 的优选立刻失效待复核，
+ *   所属曲目已排期的补录计划退回待安排（同一事务内完成）
+ */
+export async function updateTake(
+  id: string,
+  patch: Partial<Take>,
+  options: WriteOptions = {}
+): Promise<TakeSaveResult> {
+  const result: TakeSaveResult = { invalidatedPicks: 0, resetRetakes: 0 };
+  await db.transaction('rw', [db.sessions, db.takes, db.picks, db.retakes], async () => {
+    const prev = await db.takes.get(id);
+    if (!prev) throw new EditConflictError('stale', 'Take 已被另一方删除');
+    const session = await db.sessions.get(prev.sessionId);
+    const locked = lockedReason(session);
+    if (locked) throw new EditConflictError('locked', `${locked}，Take 只读，不能修改`);
+    assertNotStale(prev.updatedAt, options.expectedUpdatedAt);
+    // 弹窗期间场次被另一方编辑（含封版）也要提示，避免旧版本覆盖
+    if (session) assertNotStale(session.updatedAt, options.expectedSessionUpdatedAt);
+
+    const now = Date.now();
+    await db.takes.update(id, { ...patch, updatedAt: now } as never);
+
+    if (isTakeCoreChanged(prev, patch) && session) {
+      const note = invalidationNote(prev, patch);
+      const picks = await db.picks.where('takeId').equals(id).toArray();
+      for (const pick of picks) {
+        await db.picks.update(pick.id, {
+          reviewState: '待复核',
+          reviewNote: note,
+          updatedAt: now
+        } as never);
+      }
+      result.invalidatedPicks = picks.length;
+      const retakes = await db.retakes
+        .where('songId')
+        .equals(session.songId)
+        .filter((item) => item.state === '已排期')
+        .toArray();
+      for (const retake of retakes) {
+        await db.retakes.update(retake.id, { state: '待安排', updatedAt: now } as never);
+      }
+      result.resetRetakes = retakes.length;
+    }
+  });
+  return result;
+}
+
+/** 批量改评级：任一选中条次属于已封版场次则整批拒绝（同事务全有或全无）；评级实际改动同样触发级联 */
+export async function bulkUpdateGrade(ids: string[], grade: Take['grade']): Promise<TakeSaveResult> {
+  const result: TakeSaveResult = { invalidatedPicks: 0, resetRetakes: 0 };
+  await db.transaction('rw', [db.sessions, db.takes, db.picks, db.retakes], async () => {
+    const now = Date.now();
+    const affectedSongs = new Set<string>();
+    const invalidatedTakeNos = new Map<string, Take>();
+    for (const id of ids) {
+      const take = await db.takes.get(id);
+      if (!take) continue;
+      const session = await db.sessions.get(take.sessionId);
+      const locked = lockedReason(session);
+      if (locked) {
+        throw new EditConflictError(
+          'locked',
+          `${locked}：条次 ${take.takeNo} 所属场次不可改评级，请先取消选择或由制作人重开`
+        );
+      }
+      if (take.grade !== grade) {
+        if (session) affectedSongs.add(session.songId);
+        invalidatedTakeNos.set(id, take);
+        await db.takes.update(id, { grade, updatedAt: now } as never);
+      }
+    }
+    if (invalidatedTakeNos.size > 0) {
+      const picks = await db.picks.where('takeId').anyOf([...invalidatedTakeNos.keys()]).toArray();
+      const noteByTake = new Map<string, string>();
+      for (const [takeId, take] of invalidatedTakeNos) {
+        noteByTake.set(takeId, invalidationNote(take, { grade }));
+      }
+      for (const pick of picks) {
+        await db.picks.update(pick.id, {
+          reviewState: '待复核',
+          reviewNote: noteByTake.get(pick.takeId) ?? '源 Take 评级已改动，优选失效待复核',
+          updatedAt: now
+        } as never);
+      }
+      result.invalidatedPicks = picks.length;
+      if (affectedSongs.size > 0) {
+        const retakes = await db.retakes
+          .where('songId')
+          .anyOf([...affectedSongs])
+          .filter((item) => item.state === '已排期')
+          .toArray();
+        for (const retake of retakes) {
+          await db.retakes.update(retake.id, { state: '待安排', updatedAt: now } as never);
+        }
+        result.resetRetakes = retakes.length;
+      }
+    }
+  });
+  return result;
+}
+
+/** 删除 Take：所属场次已封版则拒绝；原有的优选级联删除保留 */
 export async function removeTake(id: string): Promise<void> {
-  await db.transaction('rw', [db.takes, db.picks], async () => {
+  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    const take = await db.takes.get(id);
+    if (take) {
+      const session = await db.sessions.get(take.sessionId);
+      const locked = lockedReason(session);
+      if (locked) throw new EditConflictError('locked', `${locked}，不能删除该 Take`);
+    }
     await db.picks.where('takeId').equals(id).delete();
     await db.takes.delete(id);
   });
@@ -225,24 +450,104 @@ export async function removeTake(id: string): Promise<void> {
 
 /* ------------------------------ 优选 ------------------------------ */
 
+/** 校验一个 Take 是否可做优选写操作：所属场次封版后只读 */
+async function assertPickTakeWritable(takeId: string): Promise<TakeRow> {
+  const take = await db.takes.get(takeId);
+  if (!take) throw new EditConflictError('invalid', '被优选的 Take 不存在');
+  const session = await db.sessions.get(take.sessionId);
+  const locked = lockedReason(session);
+  if (locked) throw new EditConflictError('locked', `${locked}，优选记录只读`);
+  return take;
+}
+
 export async function listPicks(): Promise<PickRow[]> {
   const rows = await db.picks.toArray();
   return rows.sort((a, b) => a.order - b.order);
 }
 
+/** 新增优选：目标 Take 所属场次已封版则拒绝 */
 export async function putPick(row: PickRow): Promise<void> {
-  await db.picks.put(row);
+  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    await assertPickTakeWritable(row.takeId);
+    await db.picks.put(row);
+  });
 }
 
+/** 编辑优选：若改选了 Take，新旧两个场次都必须未封版；封版场次只读 */
 export async function updatePick(id: string, patch: Partial<Pick>): Promise<void> {
-  await db.picks.update(id, { ...patch, updatedAt: Date.now() } as never);
+  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    const current = await db.picks.get(id);
+    if (!current) throw new EditConflictError('stale', '优选记录已被另一方删除');
+    await assertPickTakeWritable(current.takeId);
+    if (patch.takeId && patch.takeId !== current.takeId) {
+      await assertPickTakeWritable(patch.takeId);
+    }
+    await db.picks.update(id, { ...patch, updatedAt: Date.now() } as never);
+  });
 }
 
-/** 拖拽 / 上下移后按新顺序批量写回 */
-export async function reorderPicks(orderedIds: string[]): Promise<void> {
-  await db.transaction('rw', [db.picks], async () => {
-    for (let index = 0; index < orderedIds.length; index += 1) {
-      await db.picks.update(orderedIds[index], { order: index + 1, updatedAt: Date.now() } as never);
+/**
+ * 复核通过：待复核优选重新生效（清空失效原因），并把顺序追加到清单末尾，
+ * 避免恢复生效时与现有 order 撞号（拖拽子清单的顺序号即按恢复后的顺序重新计算）。
+ * 所属场次仍处于封版时同样只读，需制作人重开后才能确认。
+ */
+export async function confirmPickReview(id: string): Promise<void> {
+  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    const current = await db.picks.get(id);
+    if (!current) throw new EditConflictError('stale', '优选记录已被另一方删除');
+    await assertPickTakeWritable(current.takeId);
+    const rows = await db.picks.toArray();
+    const nextOrder = rows.reduce((max, row) => Math.max(max, row.order), 0) + 1;
+    await db.picks.update(id, {
+      reviewState: '生效中',
+      reviewNote: '',
+      order: nextOrder,
+      updatedAt: Date.now()
+    } as never);
+  });
+}
+
+/**
+ * 拖拽 / 上下移后按新顺序批量写回。
+ * orderedActiveIds 只含「生效中」优选（待复核项不参与拖拽），写回时保留
+ * 待复核项在原顺序中的相对槽位，合并后统一重编号，避免顺序号撞车。
+ * 任一生效条次所属场次已封版则整批拒绝。
+ */
+export async function reorderPicks(orderedActiveIds: string[]): Promise<void> {
+  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    if (orderedActiveIds.length > 0) {
+      const picks = await db.picks.bulkGet(orderedActiveIds);
+      for (const pick of picks) {
+        if (pick) await assertPickTakeWritable(pick.takeId);
+      }
+    }
+    const all = (await db.picks.toArray()).sort((a, b) => a.order - b.order);
+    // 待复核项占住自己原来的顺序槽位；生效项按拖拽后的新顺序填入其余空槽
+    const slots: (PickRow | null)[] = new Array(all.length).fill(null);
+    all.forEach((row, index) => {
+      if (row.reviewState === '待复核') slots[index] = row;
+    });
+    const activeInNewOrder = orderedActiveIds
+      .map((id) => all.find((row) => row.id === id))
+      .filter((row): row is PickRow => Boolean(row));
+    // 拖拽列表未覆盖到的生效项（防御性）按原顺序补到队尾
+    for (const row of all) {
+      if (row.reviewState !== '待复核' && !activeInNewOrder.some((item) => item.id === row.id)) {
+        activeInNewOrder.push(row);
+      }
+    }
+    let cursor = 0;
+    for (let slot = 0; slot < slots.length; slot += 1) {
+      if (!slots[slot]) {
+        slots[slot] = activeInNewOrder[cursor] ?? null;
+        cursor += 1;
+      }
+    }
+    for (let index = 0; index < slots.length; index += 1) {
+      const row = slots[index];
+      if (row && row.order !== index + 1) {
+        await db.picks.update(row.id, { order: index + 1, updatedAt: Date.now() } as never);
+      }
     }
   });
 }
@@ -252,11 +557,30 @@ export async function nextPickOrder(): Promise<number> {
   return rows.reduce((max, row) => Math.max(max, row.order), 0) + 1;
 }
 
+/** 移出优选：所属场次已封版则拒绝 */
 export async function removePick(id: string): Promise<void> {
-  await db.picks.delete(id);
+  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    const current = await db.picks.get(id);
+    if (current) await assertPickTakeWritable(current.takeId);
+    await db.picks.delete(id);
+  });
 }
 
 /* ------------------------------ 补录 ------------------------------ */
+
+/**
+ * 由问题 Take 生成补录前的封版校验：
+ * 封版场次的 Take 只读，不能在封版状态下基于它新增补录计划。
+ */
+export async function assertTakeSessionWritable(takeId: string): Promise<SessionRow> {
+  const take = await db.takes.get(takeId);
+  if (!take) throw new EditConflictError('invalid', '该条次不存在');
+  const session = await db.sessions.get(take.sessionId);
+  if (!session) throw new EditConflictError('invalid', '该条次所属场次已删除');
+  const locked = lockedReason(session);
+  if (locked) throw new EditConflictError('locked', `${locked}，不能基于该 Take 生成补录`);
+  return session;
+}
 
 export async function listRetakes(): Promise<RetakeRow[]> {
   const rows = await db.retakes.toArray();
@@ -339,6 +663,26 @@ function stamp<T>(row: T): T & Revisioned {
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
 }
 
+/** 兼容旧备份：为场次补齐封版字段 */
+function migrateSessionRow(row: Session): Session {
+  const data = row as unknown as Record<string, unknown>;
+  return {
+    ...row,
+    finalized: typeof data.finalized === 'boolean' ? (data.finalized as boolean) : false,
+    lockLogs: Array.isArray(data.lockLogs) ? (data.lockLogs as Session['lockLogs']) : []
+  };
+}
+
+/** 兼容旧备份：为优选补齐复核字段 */
+function migratePickRow(row: Pick): Pick {
+  const data = row as unknown as Record<string, unknown>;
+  return {
+    ...row,
+    reviewState: data.reviewState === '待复核' ? '待复核' : '生效中',
+    reviewNote: typeof data.reviewNote === 'string' ? data.reviewNote : ''
+  };
+}
+
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
     await Promise.all([
@@ -351,9 +695,9 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     ]);
     await db.projects.bulkPut(snapshot.projects.map(stamp));
     await db.songs.bulkPut(snapshot.songs.map(stamp));
-    await db.sessions.bulkPut(snapshot.sessions.map(stamp));
+    await db.sessions.bulkPut(snapshot.sessions.map((row) => stamp(migrateSessionRow(row))));
     await db.takes.bulkPut(snapshot.takes.map(stamp));
-    await db.picks.bulkPut(snapshot.picks.map(stamp));
+    await db.picks.bulkPut(snapshot.picks.map((row) => stamp(migratePickRow(row))));
     await db.retakes.bulkPut(snapshot.retakes.map(stamp));
   });
 }

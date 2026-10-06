@@ -37,10 +37,21 @@ const SONGS: Array<Omit<SongRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
 ];
 
 const SESSIONS: Array<Omit<SessionRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'ss-001', songId: 'sg-001', date: '2024-03-12', period: '上午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '鼓：许峰、贝斯：黎川、吉他：程野', state: '已完成' },
-  { id: 'ss-002', songId: 'sg-001', date: '2024-03-13', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '弦乐四重奏', state: '已完成' },
-  { id: 'ss-003', songId: 'sg-002', date: '2024-03-20', period: '晚上', engineer: '何笙', roomNo: 'B 棚', musicians: '大提琴：闻州', state: '已排期' },
-  { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成' }
+  {
+    id: 'ss-001',
+    songId: 'sg-001',
+    date: '2024-03-12',
+    period: '上午',
+    engineer: '赵鸣',
+    roomNo: 'A 棚',
+    musicians: '鼓：许峰、贝斯：黎川、吉他：程野',
+    state: '已完成',
+    finalized: true,
+    lockLogs: [{ action: '封版', role: '制作人', reason: '', at: Date.parse('2024-03-12T12:30:00') }]
+  },
+  { id: 'ss-002', songId: 'sg-001', date: '2024-03-13', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '弦乐四重奏', state: '已完成', finalized: false, lockLogs: [] },
+  { id: 'ss-003', songId: 'sg-002', date: '2024-03-20', period: '晚上', engineer: '何笙', roomNo: 'B 棚', musicians: '大提琴：闻州', state: '已排期', finalized: false, lockLogs: [] },
+  { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成', finalized: false, lockLogs: [] }
 ];
 
 const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
@@ -53,9 +64,9 @@ const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
 ];
 
 const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'pk-001', takeId: 'tk-001', usage: '主歌', order: 1, note: '第 1 段最稳，鼓组干净' },
-  { id: 'pk-002', takeId: 'tk-004', usage: '副歌', order: 2, note: '弦乐起弓整齐' },
-  { id: 'pk-003', takeId: 'tk-006', usage: '全曲', order: 3, note: '钢琴整轨留作参考' }
+  { id: 'pk-001', takeId: 'tk-001', usage: '主歌', order: 1, note: '第 1 段最稳，鼓组干净', reviewState: '生效中', reviewNote: '' },
+  { id: 'pk-002', takeId: 'tk-004', usage: '副歌', order: 2, note: '弦乐起弓整齐', reviewState: '生效中', reviewNote: '' },
+  { id: 'pk-003', takeId: 'tk-006', usage: '全曲', order: 3, note: '钢琴整轨留作参考', reviewState: '生效中', reviewNote: '' }
 ];
 
 const RETAKES: Array<Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [

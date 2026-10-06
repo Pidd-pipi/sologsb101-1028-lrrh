@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
+  Alert,
   Button,
   Card,
   Col,
@@ -16,19 +17,23 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   message
 } from 'antd';
-import { HolderOutlined, PlusOutlined } from '@ant-design/icons';
+import { HolderOutlined, LockOutlined, PlusOutlined } from '@ant-design/icons';
 import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import TakeBadge from '@/components/common/TakeBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import RoleSwitch from '@/components/common/RoleSwitch';
+import ReviewStateTag from '@/components/common/ReviewStateTag';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { usePickStore } from '@/stores/pickStore';
 import { db, type PickRow, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
 import { PICK_USAGES, createEmptyPick, type Pick } from '@/types/pick';
 import type { FilterModel, FilterSelectConfig } from '@/types/filter';
+import { EditConflictError } from '@/utils/lockdown';
 import { buildEditList, formatDuration, takeDuration, totalDuration } from '@/utils/timecode';
 
 const asArray = (value: string | string[] | boolean | undefined): string[] => (Array.isArray(value) ? value : []);
@@ -47,6 +52,7 @@ export default function PickSummary() {
   const createPick = usePickStore((state) => state.createPick);
   const editPick = usePickStore((state) => state.editPick);
   const deletePick = usePickStore((state) => state.deletePick);
+  const reviewPick = usePickStore((state) => state.reviewPick);
   const move = usePickStore((state) => state.move);
 
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -74,6 +80,13 @@ export default function PickSummary() {
 
   const takeOf = (takeId: string): TakeRow | null => takes.find((item) => item.id === takeId) ?? null;
 
+  /** 优选所属场次是否已封版：封版后优选只读 */
+  const pickLocked = (pick: PickRow): boolean => {
+    const take = takeOf(pick.takeId);
+    if (!take) return false;
+    return sessions.find((item) => item.id === take.sessionId)?.finalized ?? false;
+  };
+
   const sessionLabel = (sessionId: string): string => {
     const session = sessions.find((item) => item.id === sessionId);
     if (!session) return '场次已删除';
@@ -93,18 +106,41 @@ export default function PickSummary() {
         if (usages.length > 0 && !usages.includes(pick.usage)) return false;
         return true;
       })
-      .sort((a, b) => a.order - b.order);
+      .sort((a, b) => {
+        // 卡片清单：生效项在前（按顺序），待复核项排到清单末尾，恢复后回到末尾槽位
+        if ((a.reviewState === '待复核') !== (b.reviewState === '待复核')) {
+          return a.reviewState === '待复核' ? 1 : -1;
+        }
+        return a.order - b.order;
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [picks, takes, filters]);
 
+  /** 只有「可用」评级、尚未被优选且所属场次未封版的条次可作为候选 */
+  const candidates = useMemo(() => {
+    const lockedSessionIds = new Set(sessions.filter((session) => session.finalized).map((session) => session.id));
+    return takes.filter(
+      (take) =>
+        take.grade === '可用' &&
+        !picks.some((pick) => pick.takeId === take.id) &&
+        !lockedSessionIds.has(take.sessionId)
+    );
+  }, [takes, picks, sessions]);
+
+  const pendingReviewCount = picks.filter((pick) => pick.reviewState === '待复核').length;
+  const lockedPickCount = picks.filter(pickLocked).length;
+
+  /** 待复核片段不进入剪接清单（复核通过后恢复） */
+  const activePicks = useMemo(() => filtered.filter((pick) => pick.reviewState !== '待复核'), [filtered]);
+
   const editList = useMemo(
     () =>
-      filtered
+      activePicks
         .map((pick) => takeOf(pick.takeId))
         .filter((take): take is TakeRow => take !== null)
         .map((take) => ({ takeNo: take.takeNo, startTc: take.startTc, endTc: take.endTc })),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [filtered, takes]
+    [activePicks, takes]
   );
 
   const totals = useMemo(() => {
@@ -114,28 +150,31 @@ export default function PickSummary() {
       usableTakeCount: usable,
       pickRatio: usable > 0 ? Math.round((picks.length / usable) * 100) : 0,
       durationText: formatDuration(totalDuration(editList)),
-      usageCount: new Set(picks.map((item) => item.usage)).size
+      usageCount: new Set(picks.map((item) => item.usage)).size,
+      pendingReview: pendingReviewCount
     };
-  }, [picks, takes, editList]);
-
-  /** 只有「可用」评级且尚未被优选的条次可作为候选 */
-  const candidates = useMemo(
-    () => takes.filter((take) => take.grade === '可用' && !picks.some((pick) => pick.takeId === take.id)),
-    [takes, picks]
-  );
+  }, [picks, takes, editList, pendingReviewCount]);
 
   async function submit(): Promise<void> {
     const values = await form.validateFields();
-    if (editing) {
-      await editPick(editing.id, values);
-      message.success('优选记录已更新');
-    } else {
-      await createPick(values);
-      message.success('已加入剪接清单');
+    try {
+      if (editing) {
+        await editPick(editing.id, values);
+        message.success('优选记录已更新');
+      } else {
+        await createPick(values);
+        message.success('已加入剪接清单');
+      }
+      setDialogOpen(false);
+      setEditing(null);
+      form.resetFields();
+    } catch (error) {
+      if (error instanceof EditConflictError) {
+        message.error(error.message);
+        return;
+      }
+      message.error(error instanceof Error ? error.message : '保存失败');
     }
-    setDialogOpen(false);
-    setEditing(null);
-    form.resetFields();
   }
 
   async function handleDrop(index: number): Promise<void> {
@@ -143,8 +182,22 @@ export default function PickSummary() {
     setDragIndex(null);
     setOverIndex(null);
     if (from === null || from === index) return;
-    await move(filtered as Pick[], from, index);
-    message.success('剪接顺序已更新并写回本地库');
+    try {
+      // 拖拽子清单只含生效中的优选，移动时按生效清单的下标映射回完整优选列表
+      await move(activePicks as Pick[], from, index);
+      message.success('剪接顺序已更新并写回本地库');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '调整顺序失败');
+    }
+  }
+
+  async function handleReview(pick: PickRow): Promise<void> {
+    try {
+      await reviewPick(pick.id);
+      message.success('复核通过，优选已重新生效');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '复核失败');
+    }
   }
 
   const selects: FilterSelectConfig[] = [
@@ -176,6 +229,7 @@ export default function PickSummary() {
         <StatBadge label="优选条次" value={totals.pickCount} suffix="条" tone="primary" icon="files" />
         <StatBadge label="可用 Take" value={totals.usableTakeCount} suffix="条" tone="success" icon="grid" />
         <StatBadge label="优选覆盖率" value={totals.pickRatio} percent={totals.pickRatio} showPercent tone="warning" icon="pie" />
+        <StatBadge label="待复核" value={totals.pendingReview} suffix="条" tone="danger" icon="warning" />
         <StatBadge label="剪接总时长" value={totals.durationText} tone="info" icon="histogram" />
         <StatBadge label="用途种类" value={totals.usageCount} suffix="类" tone="danger" icon="trend" />
       </div>
@@ -192,10 +246,44 @@ export default function PickSummary() {
         extra={<Tag color="blue">候选可用 Take {candidates.length} 条</Tag>}
       />
 
+      {pendingReviewCount > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`有 ${pendingReviewCount} 条优选因源 Take 的时间码 / 评级 / 问题标签改动而失效，待制作人复核`}
+          description="待复核条次暂不进入剪接清单；请核对源 Take 后点「复核通过」，或删除重选。"
+        />
+      ) : null}
+      {lockedPickCount > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          icon={<LockOutlined />}
+          message={`${lockedPickCount} 条优选属于已封版场次，仅可查看，不能编辑 / 排序 / 移出`}
+        />
+      ) : null}
+
+      <FilterBar
+        modelValue={filters}
+        selects={selects}
+        keywordPlaceholder="搜索用途 / 备注 / Take 号…"
+        onChange={applyFilters}
+        onReset={() => {
+          resetFilters();
+          setSearchParams({}, { replace: true });
+        }}
+        extra={
+          <Space>
+            <Tag color="blue">候选可用 Take {candidates.length} 条</Tag>
+            <RoleSwitch compact />
+          </Space>
+        }
+      />
+
       {filtered.length === 0 ? (
         <EmptyPanel
           title="剪接清单还是空的"
-          description="从可用评级的 Take 中挑选片段，组成主歌 / 副歌 / 独奏的剪接清单。"
+          description="从可用评级、未封版场次的 Take 中挑选片段，组成主歌 / 副歌 / 独奏的剪接清单。"
           showCreate={candidates.length > 0}
           createText="加入优选"
           onCreate={() => {
@@ -208,48 +296,81 @@ export default function PickSummary() {
         <Row gutter={16}>
           <Col xs={24} xl={15}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
-              {filtered.map((pick, index) => {
+              {filtered.map((pick) => {
                 const take = takeOf(pick.takeId);
+                const locked = pickLocked(pick);
+                const activeIndex = activePicks.findIndex((item) => item.id === pick.id);
                 return (
                   <Card
                     key={pick.id}
                     size="small"
-                    draggable
-                    className={dragIndex === index ? 'is-dragging' : overIndex === index ? 'is-over' : ''}
-                    onDragStart={() => setDragIndex(index)}
+                    draggable={!locked && pick.reviewState !== '待复核'}
+                    className={[
+                      dragIndex === activeIndex ? 'is-dragging' : '',
+                      overIndex === activeIndex ? 'is-over' : '',
+                      locked ? 'session-row-locked' : '',
+                      pick.reviewState === '待复核' ? 'pick-row-review' : ''
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                    onDragStart={() => setDragIndex(activeIndex)}
                     onDragOver={(event) => {
+                      if (locked || activeIndex < 0) return;
                       event.preventDefault();
-                      setOverIndex(index);
+                      setOverIndex(activeIndex);
                     }}
-                    onDrop={() => void handleDrop(index)}
-                    onDragEnd={() => setDragIndex(null)}
+                    onDrop={() => void handleDrop(activeIndex)}
+                    onDragEnd={() => {
+                      setDragIndex(null);
+                      setOverIndex(null);
+                    }}
                     title={
-                      <Space>
+                      <Space wrap>
                         <HolderOutlined className="drag-handle" />
-                        <span>#{index + 1}</span>
+                        <span>#{activeIndex >= 0 ? activeIndex + 1 : '—'}</span>
                         <Tag color="blue">{pick.usage}</Tag>
                         {take ? <TakeBadge grade={take.grade} issues={take.issues} showIssues={false} /> : null}
+                        <ReviewStateTag pick={pick} />
+                        {locked ? (
+                          <Tooltip title="所属场次已封版，只读">
+                            <Tag icon={<LockOutlined />} color="red">
+                              封版只读
+                            </Tag>
+                          </Tooltip>
+                        ) : null}
                       </Space>
                     }
                     extra={
-                      <Space>
+                      <Space wrap>
+                        {pick.reviewState === '待复核' ? (
+                          <Button
+                            size="small"
+                            type="primary"
+                            ghost
+                            disabled={locked}
+                            onClick={() => void handleReview(pick)}
+                          >
+                            复核通过
+                          </Button>
+                        ) : null}
                         <Button
                           size="small"
-                          disabled={index === 0}
-                          onClick={() => void move(filtered as Pick[], index, index - 1)}
+                          disabled={activeIndex <= 0 || locked}
+                          onClick={() => void move(activePicks as Pick[], activeIndex, activeIndex - 1)}
                         >
                           上移
                         </Button>
                         <Button
                           size="small"
-                          disabled={index === filtered.length - 1}
-                          onClick={() => void move(filtered as Pick[], index, index + 1)}
+                          disabled={activeIndex < 0 || activeIndex >= activePicks.length - 1 || locked}
+                          onClick={() => void move(activePicks as Pick[], activeIndex, activeIndex + 1)}
                         >
                           下移
                         </Button>
                         <Button
                           size="small"
                           type="link"
+                          disabled={locked}
                           onClick={() => {
                             setEditing(pick);
                             form.setFieldsValue({ takeId: pick.takeId, usage: pick.usage, note: pick.note });
@@ -261,11 +382,16 @@ export default function PickSummary() {
                         <Popconfirm
                           title="移出剪接清单？"
                           onConfirm={async () => {
-                            await deletePick(pick.id);
-                            message.success('已移出剪接清单');
+                            try {
+                              await deletePick(pick.id);
+                              message.success('已移出剪接清单');
+                            } catch (error) {
+                              message.error(error instanceof Error ? error.message : '删除失败');
+                            }
                           }}
+                          disabled={locked}
                         >
-                          <Button size="small" type="link" danger>
+                          <Button size="small" type="link" danger disabled={locked}>
                             删除
                           </Button>
                         </Popconfirm>
@@ -280,6 +406,9 @@ export default function PickSummary() {
                         {take ? `${sessionLabel(take.sessionId)} · 时长 ${formatDuration(takeDuration(take.startTc, take.endTc))}` : '—'}
                       </Typography.Text>
                       <Typography.Text type="secondary">备注：{pick.note || '—'}</Typography.Text>
+                      {pick.reviewState === '待复核' ? (
+                        <Typography.Text type="warning">{pick.reviewNote || '源 Take 已改动，优选失效待复核'}</Typography.Text>
+                      ) : null}
                     </Space>
                   </Card>
                 );
@@ -337,6 +466,11 @@ export default function PickSummary() {
                 return take ? `${take.takeNo} · ${take.startTc} → ${take.endTc}` : '条次已删除';
               }
             },
+            {
+              title: '复核状态',
+              width: 110,
+              render: (_, row) => <ReviewStateTag pick={row} />
+            },
             { title: '备注', dataIndex: 'note', minWidth: 200 },
             {
               title: '时长',
@@ -359,17 +493,32 @@ export default function PickSummary() {
         cancelText="取消"
         destroyOnClose
       >
+        {editing?.reviewState === '待复核' ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={editing.reviewNote || '源 Take 已改动，该优选待复核'}
+            description="修改并保存后请返回清单点「复核通过」，或直接在清单上确认。"
+          />
+        ) : null}
         <Form form={form} layout="vertical">
           <Form.Item name="takeId" label="条次" rules={[{ required: true, message: '请选择条次' }]}>
             <Select
               showSearch
               optionFilterProp="label"
-              options={(editing ? takes.filter((take) => take.grade === '可用' || take.id === editing.takeId) : candidates).map(
-                (take) => ({
-                  label: `${take.takeNo} · ${take.startTc} → ${take.endTc}`,
-                  value: take.id
-                })
-              )}
+              disabled={editing ? pickLocked(editing) : false}
+              options={(editing
+                ? takes.filter(
+                    (take) =>
+                      (take.grade === '可用' || take.id === editing.takeId) &&
+                      !sessions.find((session) => session.id === take.sessionId && session.finalized)
+                  )
+                : candidates
+              ).map((take) => ({
+                label: `${take.takeNo} · ${take.startTc} → ${take.endTc}`,
+                value: take.id
+              }))}
             />
           </Form.Item>
           <Form.Item name="usage" label="用途" rules={[{ required: true }]}>

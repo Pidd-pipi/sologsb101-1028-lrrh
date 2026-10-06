@@ -1,4 +1,4 @@
-/** /takes Take 标记台：录入起止时间码、问题标签与评级，支持批量改评级 */
+/** /takes Take 标记台：录入起止时间码、问题标签与评级，支持批量改评级；封版场次只读 */
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
@@ -13,22 +13,25 @@ import {
   Select,
   Space,
   Table,
+  Tag,
   Tooltip,
   message
 } from 'antd';
-import { PlusOutlined } from '@ant-design/icons';
+import { LockOutlined, PlusOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import TakeBadge from '@/components/common/TakeBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import RoleSwitch from '@/components/common/RoleSwitch';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useTakeFilter } from '@/hooks/useTakeFilter';
 import { useTakeStore } from '@/stores/takeStore';
 import { useSessionStore } from '@/stores/sessionStore';
-import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow, type TakeSaveResult } from '@/utils/db';
 import { TAKE_GRADES, TAKE_ISSUES, createEmptyTake, type Take, type TakeGrade } from '@/types/take';
 import type { FilterSelectConfig } from '@/types/filter';
+import { EditConflictError } from '@/utils/lockdown';
 import {
   formatDuration,
   isOverlapping,
@@ -60,9 +63,17 @@ export default function TakeBoard() {
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
 
   const [dialogOpen, setDialogOpen] = useState(false);
+  /** 只读查看（封版场次的 Take） */
+  const [readOnly, setReadOnly] = useState(false);
   const [editing, setEditing] = useState<TakeRow | null>(null);
+  /** 乐观并发依据：编辑前 Take 行 / 场次行的 updatedAt */
+  const [baseTakeVersion, setBaseTakeVersion] = useState<number | undefined>(undefined);
+  const [baseSessionVersion, setBaseSessionVersion] = useState<number | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const [form] = Form.useForm<Omit<Take, 'id'>>();
+  /** 表单内当前选择的场次是否已封版（用于禁用保存） */
+  const pickedSessionId = Form.useWatch('sessionId', form) as string | undefined;
 
   useEffect(() => {
     setFilters({
@@ -89,8 +100,10 @@ export default function TakeBoard() {
     setSearchParams(params, { replace: true });
   }
 
+  const sessionOf = (sessionId: string): SessionRow | null => sessions.find((item) => item.id === sessionId) ?? null;
+
   const sessionLabel = (sessionId: string): string => {
-    const session = sessions.find((item) => item.id === sessionId);
+    const session = sessionOf(sessionId);
     if (!session) return '场次已删除';
     const song = songs.find((item) => item.id === session.songId);
     const project = song ? projects.find((item) => item.id === song.projectId) : undefined;
@@ -115,6 +128,8 @@ export default function TakeBoard() {
     [filtered, currentSessionId]
   );
 
+  const lockedSessionCount = useMemo(() => sessions.filter((session) => session.finalized).length, [sessions]);
+
   const totals = useMemo(() => {
     const usable = scoped.filter((take) => take.grade === '可用').length;
     const issues = scoped.filter((take) => take.issues.some((issue) => issue !== '无')).length;
@@ -125,22 +140,41 @@ export default function TakeBoard() {
       discarded: scoped.filter((take) => take.grade === '废').length,
       usableRatio: scoped.length > 0 ? Math.round((usable / scoped.length) * 100) : 0,
       issueCount: issues,
-      durationText: formatDuration(totalDuration(scoped))
+      durationText: formatDuration(totalDuration(scoped)),
+      lockedTakes: scoped.filter((take) => sessionOf(take.sessionId)?.finalized).length
     };
-  }, [scoped]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scoped, sessions]);
+
+  function reportCascade(result: TakeSaveResult): void {
+    if (result.invalidatedPicks > 0) {
+      message.warning(`优选 Take 已失效 ${result.invalidatedPicks} 条，置为待复核，请制作人确认`);
+    }
+    if (result.resetRetakes > 0) {
+      message.warning(`同曲目已排期补录计划 ${result.resetRetakes} 条已退回待安排`);
+    }
+  }
 
   const columns: ColumnsType<TakeRow> = [
     {
       title: '场次',
       minWidth: 240,
-      render: (_, row) => (
-        <div>
-          <div>{sessionLabel(row.sessionId)}</div>
-          <div className="muted">
-            时长 {formatDuration(takeDuration(row.startTc, row.endTc))} · 条次 {row.takeNo}
+      render: (_, row) => {
+        const session = sessionOf(row.sessionId);
+        return (
+          <div>
+            <div>{sessionLabel(row.sessionId)}</div>
+            <div className="muted">
+              时长 {formatDuration(takeDuration(row.startTc, row.endTc))} · 条次 {row.takeNo}
+            </div>
+            {session?.finalized ? (
+              <Tag icon={<LockOutlined />} color="red" style={{ marginTop: 4 }}>
+                场次已封版 · 只读
+              </Tag>
+            ) : null}
           </div>
-        </div>
-      )
+        );
+      }
     },
     { title: 'Take 号', dataIndex: 'takeNo', width: 90 },
     { title: '起始时间码', dataIndex: 'startTc', width: 130 },
@@ -153,41 +187,56 @@ export default function TakeBoard() {
     {
       title: '操作',
       width: 150,
-      render: (_, row) => (
-        <Space>
-          <Button
-            type="link"
-            size="small"
-            onClick={() => {
-              setEditing(row);
-              setError(null);
-              form.setFieldsValue({
-                sessionId: row.sessionId,
-                takeNo: row.takeNo,
-                startTc: row.startTc,
-                endTc: row.endTc,
-                grade: row.grade,
-                issues: row.issues
-              });
-              setDialogOpen(true);
-            }}
-          >
-            编辑
-          </Button>
-          <Popconfirm
-            title="删除该条次？"
-            description="对应的优选记录也会一并删除"
-            onConfirm={async () => {
-              await deleteTake(row.id);
-              message.success('条次已删除');
-            }}
-          >
-            <Button type="link" size="small" danger>
-              删除
+      render: (_, row) => {
+        const locked = sessionOf(row.sessionId)?.finalized ?? false;
+        return (
+          <Space>
+            <Button
+              type="link"
+              size="small"
+              onClick={() => {
+                const session = sessionOf(row.sessionId);
+                setEditing(row);
+                setError(null);
+                setStale(false);
+                setReadOnly(locked);
+                setBaseTakeVersion(row.updatedAt);
+                setBaseSessionVersion(session?.updatedAt);
+                form.setFieldsValue({
+                  sessionId: row.sessionId,
+                  takeNo: row.takeNo,
+                  startTc: row.startTc,
+                  endTc: row.endTc,
+                  grade: row.grade,
+                  issues: row.issues
+                });
+                setDialogOpen(true);
+              }}
+            >
+              {locked ? '查看' : '编辑'}
             </Button>
-          </Popconfirm>
-        </Space>
-      )
+            <Popconfirm
+              title="删除该条次？"
+              description={
+                locked ? '场次已封版，Take 只读' : '对应的优选记录也会一并删除'
+              }
+              onConfirm={async () => {
+                try {
+                  await deleteTake(row.id);
+                  message.success('条次已删除');
+                } catch (error) {
+                  message.error(error instanceof Error ? error.message : '删除失败');
+                }
+              }}
+              disabled={locked}
+            >
+              <Button type="link" size="small" danger disabled={locked}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      }
     }
   ];
 
@@ -210,27 +259,89 @@ export default function TakeBoard() {
     const siblings = takes.filter((take) => take.sessionId === values.sessionId && take.id !== editing?.id);
     const clash = siblings.find((take) => isOverlapping(values.startTc, values.endTc, take.startTc, take.endTc));
     setError(null);
-    if (editing) {
-      await editTake(editing.id, values);
-      message.success('条次已更新');
-    } else {
-      await createTake(values);
-      message.success('条次已标记');
+    const targetSession = sessionOf(values.sessionId);
+    if (targetSession?.finalized) {
+      setError('该场次已封版，不能新增或修改 Take，请由制作人重开后再试');
+      message.error('场次已封版');
+      return;
     }
-    if (clash) {
-      message.warning(`注意：与同场次 ${clash.takeNo}（${clash.startTc} → ${clash.endTc}）时间码重叠`);
+    try {
+      if (editing) {
+        const result = await editTake(editing.id, values, {
+          expectedUpdatedAt: baseTakeVersion,
+          expectedSessionUpdatedAt: baseSessionVersion
+        });
+        message.success('条次已更新');
+        reportCascade(result);
+      } else {
+        await createTake(values);
+        message.success('条次已标记');
+      }
+      if (clash) {
+        message.warning(`注意：与同场次 ${clash.takeNo}（${clash.startTc} → ${clash.endTc}）时间码重叠`);
+      }
+      setDialogOpen(false);
+      setEditing(null);
+      setReadOnly(false);
+      setBaseTakeVersion(undefined);
+      setBaseSessionVersion(undefined);
+      form.resetFields();
+    } catch (submitError) {
+      // 冲突：保留弹窗与输入，按已封版 / 已改动提示，不覆盖新版本
+      if (submitError instanceof EditConflictError) {
+        setError(submitError.message);
+        if (submitError.kind === 'stale') {
+          setStale(true);
+          message.warning('场次或条次已改动，本条次未保存，请载入最新版本核对（输入已保留）');
+        } else {
+          message.error(submitError.message);
+        }
+        return;
+      }
+      const text = submitError instanceof Error ? submitError.message : '保存失败';
+      setError(text);
+      message.error(text);
     }
-    setDialogOpen(false);
-    setEditing(null);
-    form.resetFields();
+  }
+
+  /** 冲突后载入最新版本：保留弹窗，仅把字段刷新为库里的新版本，用户可在其上继续改 */
+  function reloadLatest(): void {
+    if (!editing) return;
+    const fresh = takes.find((item) => item.id === editing.id);
+    const freshSession = fresh ? sessionOf(fresh.sessionId) : undefined;
+    if (!fresh) {
+      message.error('该条次已被另一方删除');
+      setDialogOpen(false);
+      setEditing(null);
+      return;
+    }
+    setEditing(fresh);
+    setBaseTakeVersion(fresh.updatedAt);
+    setBaseSessionVersion(freshSession?.updatedAt);
+    setReadOnly(Boolean(freshSession?.finalized));
+    setStale(false);
+    setError(null);
+    form.setFieldsValue({
+      sessionId: fresh.sessionId,
+      takeNo: fresh.takeNo,
+      startTc: fresh.startTc,
+      endTc: fresh.endTc,
+      grade: fresh.grade,
+      issues: fresh.issues
+    });
+    message.info('已载入另一方保存的最新版本，您的输入可在其基础上继续修改');
   }
 
   /** 打开新增弹窗时自动递增 Take 号 */
   function openCreate(): void {
-    const targetSessionId = currentSessionId ?? sessions[0]?.id ?? '';
+    const targetSessionId = currentSessionId ?? sessions.find((session) => !session.finalized)?.id ?? sessions[0]?.id ?? '';
     const siblings = takes.filter((take) => take.sessionId === targetSessionId);
     setEditing(null);
+    setReadOnly(false);
+    setBaseTakeVersion(undefined);
+    setBaseSessionVersion(undefined);
     setError(null);
+    setStale(false);
     form.setFieldsValue({
       ...createEmptyTake(),
       sessionId: targetSessionId,
@@ -239,18 +350,42 @@ export default function TakeBoard() {
     setDialogOpen(true);
   }
 
+  const selectedLockedCount = selectedIds.filter((id) => {
+    const take = takes.find((item) => item.id === id);
+    return take ? sessionOf(take.sessionId)?.finalized : false;
+  }).length;
+
+  async function handleBatchGrade(grade: TakeGrade): Promise<void> {
+    try {
+      const result = await batchGrade(selectedIds, grade);
+      message.success(`已将 ${selectedIds.length} 条改为「${grade}」`);
+      reportCascade(result);
+    } catch (error) {
+      if (error instanceof EditConflictError) {
+        message.error(error.message);
+        return;
+      }
+      message.error(error instanceof Error ? error.message : '批量改评级失败');
+    }
+  }
+
+  const watchedSessionLocked = pickedSessionId ? sessionOf(pickedSessionId)?.finalized : false;
+
   return (
     <div className="page">
       <div className="page__head">
         <div>
           <h2 className="page__title">Take 标记台</h2>
           <p className="page__subtitle">
-            时间码格式 HH:MM:SS:FF（{25} 帧）；结束时间码必须晚于起始，重叠会给出提示。
+            时间码格式 HH:MM:SS:FF（{25} 帧）；封版场次只读；时间码 / 评级 / 问题标签改动会立刻使优选失效、补录退回待安排。
           </p>
         </div>
-        <Button type="primary" icon={<PlusOutlined />} disabled={sessions.length === 0} onClick={openCreate}>
-          标记 Take
-        </Button>
+        <Space>
+          <RoleSwitch compact />
+          <Button type="primary" icon={<PlusOutlined />} disabled={sessions.length === 0} onClick={openCreate}>
+            标记 Take
+          </Button>
+        </Space>
       </div>
 
       <div className="badge-row">
@@ -258,10 +393,19 @@ export default function TakeBoard() {
         <StatBadge label="可用" value={totals.usable} suffix="条" tone="success" icon="grid" />
         <StatBadge label="待定" value={totals.pending} suffix="条" tone="warning" icon="histogram" />
         <StatBadge label="废条" value={totals.discarded} suffix="条" tone="danger" icon="warning" />
+        <StatBadge label="封版只读" value={totals.lockedTakes} suffix="条" tone="danger" icon="warning" />
         <StatBadge label="可用率" value={totals.usableRatio} percent={totals.usableRatio} showPercent tone="info" icon="pie" />
         <StatBadge label="有问题的条次" value={totals.issueCount} suffix="条" tone="danger" icon="warning" />
         <StatBadge label="合计时长" value={totals.durationText} tone="default" icon="trend" />
       </div>
+
+      {lockedSessionCount > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          message={`已有 ${lockedSessionCount} 个场次封版，封版场次的 Take 仅可查看，不能增删改或批量改评级`}
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filters}
@@ -296,14 +440,16 @@ export default function TakeBoard() {
         extra={
           <Space>
             <span className="muted">已选 {selectedIds.length} 条</span>
+            {selectedLockedCount > 0 ? (
+              <Tooltip title="选中条次包含封版场次，整批会被拦截">
+                <Tag color="red">含 {selectedLockedCount} 条封版只读</Tag>
+              </Tooltip>
+            ) : null}
             <Segmented
               options={TAKE_GRADES}
               disabled={selectedIds.length === 0}
               onChange={(value) => {
-                void (async () => {
-                  await batchGrade(selectedIds, value as TakeGrade);
-                  message.success(`已将 ${selectedIds.length} 条改为「${value}」`);
-                })();
+                void handleBatchGrade(value as TakeGrade);
               }}
             />
             <Button size="small" disabled={selectedIds.length === 0} onClick={() => setSelected([])}>
@@ -326,10 +472,14 @@ export default function TakeBoard() {
             dataSource={scoped}
             columns={columns}
             pagination={false}
+            rowClassName={(row) => (sessionOf(row.sessionId)?.finalized ? 'session-row-locked' : '')}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelected(keys as string[]),
-              onSelect: (row) => toggleSelected(row.id)
+              onSelect: (row) => toggleSelected(row.id),
+              getCheckboxProps: (row) => ({
+                disabled: sessionOf(row.sessionId)?.finalized ?? false
+              })
             }}
           />
         )}
@@ -337,20 +487,47 @@ export default function TakeBoard() {
 
       <Modal
         open={dialogOpen}
-        title={editing ? '编辑条次' : '标记 Take'}
-        onCancel={() => setDialogOpen(false)}
+        title={
+          readOnly
+            ? '查看条次（场次已封版 · 只读）'
+            : editing
+              ? '编辑条次'
+              : '标记 Take'
+        }
+        onCancel={() => {
+          setDialogOpen(false);
+          setEditing(null);
+          setReadOnly(false);
+          setBaseTakeVersion(undefined);
+          setBaseSessionVersion(undefined);
+        }}
         onOk={submit}
         okText="保存"
         cancelText="取消"
+        okButtonProps={{ disabled: readOnly || watchedSessionLocked }}
         destroyOnClose
       >
-        {error ? <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} /> : null}
-        <Form form={form} layout="vertical">
+        {error ? <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} action={
+          stale ? <Button size="small" onClick={reloadLatest}>载入最新版本</Button> : undefined
+        } /> : null}
+        {watchedSessionLocked ? (
+          <Alert
+            type="error"
+            showIcon
+            icon={<LockOutlined />}
+            style={{ marginBottom: 12 }}
+            message="该场次已封版，不能在此新增 / 修改 Take；请由制作人重开后再试。"
+          />
+        ) : null}
+        <Form form={form} layout="vertical" disabled={readOnly}>
           <Form.Item name="sessionId" label="场次" rules={[{ required: true, message: '请选择场次' }]}>
             <Select
               showSearch
               optionFilterProp="label"
-              options={sessions.map((session) => ({ label: sessionLabel(session.id), value: session.id }))}
+              options={sessions.map((session) => ({
+                label: `${session.finalized ? '🔒 ' : ''}${sessionLabel(session.id)}`,
+                value: session.id
+              }))}
               onChange={(value: string) => {
                 const siblings = takes.filter((take) => take.sessionId === value);
                 form.setFieldsValue({ takeNo: suggestNextTakeNo(sortByStart(siblings)) });
@@ -392,7 +569,7 @@ export default function TakeBoard() {
           </Form.Item>
         </Form>
         <Tooltip title="同场次内 Take 号会自动递增，也可手动修改">
-          <span className="muted">提示：切换到其它场次会自动带出下一个 Take 号</span>
+          <span className="muted">提示：切换到其它场次会自动带出下一个 Take 号；封版场次仅供查看。</span>
         </Tooltip>
       </Modal>
     </div>

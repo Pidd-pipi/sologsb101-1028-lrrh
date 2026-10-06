@@ -165,3 +165,18 @@ body {
 .take-row-selected {
   background: #eef6fb;
 }
+
+/* 已封版场次行：淡红底，提示只读 */
+.session-row-locked {
+  background: #fdf3f3;
+}
+
+.session-row-locked:hover > td {
+  background: #fbeaea !important;
+}
+
+/* 待复核优选卡片：橙色描边 */
+.pick-row-review {
+  border-color: #f0b666 !important;
+  box-shadow: inset 3px 0 0 #fa8c16;
+}

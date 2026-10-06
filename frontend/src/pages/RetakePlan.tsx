@@ -18,13 +18,15 @@ import {
   Typography,
   message
 } from 'antd';
-import { DownloadOutlined, PlusOutlined, UploadOutlined } from '@ant-design/icons';
+import { DownloadOutlined, LockOutlined, PlusOutlined, UploadOutlined } from '@ant-design/icons';
 import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import TakeBadge from '@/components/common/TakeBadge';
+import RoleSwitch from '@/components/common/RoleSwitch';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useProjectStore } from '@/stores/projectStore';
 import {
+  assertTakeSessionWritable,
   db,
   countAll,
   exportSnapshot,
@@ -80,16 +82,26 @@ export default function RetakePlan() {
     ? retakes.filter((retake) => songOf(retake.songId)?.projectId === currentProjectId)
     : retakes;
 
-  /** 由有问题的 Take 生成补录建议 */
+  /** 由有问题的 Take 生成补录建议（封版场次的 Take 不可生成补录） */
   const problemTakes = useMemo(
     () =>
-      takes.filter(
-        (take) =>
-          take.issues.some((issue) => issue !== '无') ||
-          take.grade === '废' ||
-          take.grade === '待定'
-      ),
-    [takes]
+      takes.filter((take) => {
+        if (
+          !take.issues.some((issue) => issue !== '无') &&
+          take.grade !== '废' &&
+          take.grade !== '待定'
+        ) {
+          return false;
+        }
+        const session = sessions.find((item) => item.id === take.sessionId);
+        return session && !session.finalized;
+      }),
+    [takes, sessions]
+  );
+
+  const resetHintRetakes = useMemo(
+    () => scopedRetakes.filter((item) => item.state === '待安排'),
+    [scopedRetakes]
   );
 
   const totals = useMemo(() => {
@@ -122,24 +134,24 @@ export default function RetakePlan() {
 
   /** 由问题 Take 直接生成补录条目 */
   async function createFromTake(take: TakeRow): Promise<void> {
-    const session = sessions.find((item) => item.id === take.sessionId);
-    if (!session) {
-      message.error('该条次所属场次已删除，无法生成补录');
-      return;
+    try {
+      const session = await assertTakeSessionWritable(take.id);
+      const reasons = take.issues.filter((issue) => issue !== '无').join('、');
+      await putRetake(
+        buildRow(
+          {
+            songId: session.songId,
+            reason: `${take.takeNo}（${take.startTc} → ${take.endTc}）${reasons ? `问题：${reasons}` : '评级不理想'}，需补录`,
+            planDate: new Date().toISOString().slice(0, 10),
+            state: '待安排'
+          } as Omit<Retake, 'id'>,
+          'retake'
+        )
+      );
+      message.success('已生成补录条目');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '生成补录失败');
     }
-    const reasons = take.issues.filter((issue) => issue !== '无').join('、');
-    await putRetake(
-      buildRow(
-        {
-          songId: session.songId,
-          reason: `${take.takeNo}（${take.startTc} → ${take.endTc}）${reasons ? `问题：${reasons}` : '评级不理想'}，需补录`,
-          planDate: new Date().toISOString().slice(0, 10),
-          state: '待安排'
-        } as Omit<Retake, 'id'>,
-        'retake'
-      )
-    );
-    message.success('已生成补录条目');
   }
 
   async function exportSheet(): Promise<void> {
@@ -183,10 +195,11 @@ export default function RetakePlan() {
         <div>
           <h2 className="page__title">补录计划与结构版本导出</h2>
           <p className="page__subtitle">
-            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 补录完成后自动联动曲目录制状态。
+            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 补录完成后自动联动曲目状态；源 Take 改动时已排期补录退回待安排。
           </p>
         </div>
         <Space>
+          <RoleSwitch compact />
           <Button icon={<DownloadOutlined />} onClick={exportLibrary}>
             导出整库备份
           </Button>
@@ -217,9 +230,24 @@ export default function RetakePlan() {
 
       {error ? <Alert type="error" showIcon message={error} closable onClose={() => setError(null)} /> : null}
 
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 0 }}
+        message="封版与补录联动规则"
+        description="场次封版后，其 Take 不能再生成补录；任一已标记 Take 的时间码 / 评级 / 问题标签改动后，同曲目「已排期」补录计划自动退回「待安排」，需重新排期。"
+      />
+
       <Row gutter={16}>
         <Col xs={24} xl={16}>
-          <Card title={`补录清单（${scopedRetakes.length}）`}>
+          <Card
+            title={`补录清单（${scopedRetakes.length}）`}
+            extra={
+              resetHintRetakes.length > 0 ? (
+                <Tag color="orange">{resetHintRetakes.length} 条待重新排期</Tag>
+              ) : null
+            }
+          >
             {scopedRetakes.length === 0 ? (
               <EmptyPanel
                 title="暂无补录计划"
@@ -246,12 +274,14 @@ export default function RetakePlan() {
                     dataIndex: 'state',
                     width: 110,
                     render: (value: string) => (
-                      <Tag color={value === '已完成' ? 'green' : value === '已排期' ? 'blue' : 'orange'}>{value}</Tag>
+                      <Tag color={value === '已完成' ? 'green' : value === '已排期' ? 'blue' : 'orange'}>
+                        {value}
+                      </Tag>
                     )
                   },
                   {
                     title: '操作',
-                    width: 210,
+                    width: 230,
                     render: (_, row) => (
                       <Space>
                         <Select
@@ -316,7 +346,9 @@ export default function RetakePlan() {
           <Space direction="vertical" size={16} style={{ width: '100%' }}>
             <Card title="由问题 Take 生成补录">
               {problemTakes.length === 0 ? (
-                <Typography.Text type="secondary">当前没有评级不理想或带问题标签的条次。</Typography.Text>
+                <Typography.Text type="secondary">
+                  当前没有评级不理想、带问题标签且所属场次未封版的条次。
+                </Typography.Text>
               ) : (
                 <Table<TakeRow>
                   rowKey="id"
@@ -326,12 +358,20 @@ export default function RetakePlan() {
                   columns={[
                     {
                       title: '条次',
-                      render: (_, row) => (
-                        <Space direction="vertical" size={2}>
-                          <span>{row.takeNo}</span>
-                          <TakeBadge grade={row.grade} issues={row.issues} />
-                        </Space>
-                      )
+                      render: (_, row) => {
+                        const session = sessions.find((item) => item.id === row.sessionId);
+                        return (
+                          <Space direction="vertical" size={2}>
+                            <span>{row.takeNo}</span>
+                            <TakeBadge grade={row.grade} issues={row.issues} />
+                            {session?.finalized ? (
+                              <Tag icon={<LockOutlined />} color="red">
+                                场次封版
+                              </Tag>
+                            ) : null}
+                          </Space>
+                        );
+                      }
                     },
                     {
                       title: '生成',

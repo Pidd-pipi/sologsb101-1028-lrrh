@@ -5,4 +5,4 @@
  */
 
 /** 行结构修订号：每次调整行结构 +1 并在 upgrade() 中补迁移 */
-export const ROW_REVISION = 1;
+export const ROW_REVISION = 2;
